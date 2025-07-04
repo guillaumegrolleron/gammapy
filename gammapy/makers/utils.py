@@ -682,6 +682,46 @@ def make_counts_off_rad_max(geom_off, rad_max, events):
     return counts_off
 
 
+def make_acceptance(geom, rad_min, rad_max, events):
+    """Extract the acceptance of a list of point regions and given rad min and rad max,
+    defining the background nomalization regions of the theta2.
+
+    This method does **not** check for overlap of the regions defined by rad max.
+
+    Parameters
+    ----------
+    geom : `~gammapy.maps.RegionGeom`
+        Reference map geometry for the on region.
+    rad_min : '~astropy.units.Quantity'
+        The rad_min value defining the background nomalization region.
+    rad_max : '~astropy.units.Quantity'
+        The rad_max value defining the background nomalization region.
+    events : `~gammapy.data.EventList`
+        Event list to be used to compute the OFF counts.
+
+    Returns
+    -------
+    acceptance_off : `~gammapy.maps.RegionNDMap`
+        Acceptance vs estimated energy extracted from the ON region.
+    """
+    if not geom.is_all_point_sky_regions:
+        raise ValueError(f"Only supports PointSkyRegions, got {geom.region} instead")
+
+    acceptance_off = RegionNDMap.from_geom(geom=geom)
+
+    for off_region in compound_region_to_regions(geom.region):
+        separation = off_region.center.separation(events.radec)
+
+        selected = np.logical_and(
+            separation >= rad_min,
+            separation <= rad_max,
+        )
+        selected_events = events.select_row_subset(selected)
+        acceptance_off.fill_events(selected_events)
+
+    return acceptance_off
+
+
 def make_observation_time_map(observations, geom, offset_max=None):
     """
     Compute the total observation time on the target geometry
