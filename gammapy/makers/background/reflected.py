@@ -10,7 +10,7 @@ from regions import CircleSkyRegion, PixCoord, PointSkyRegion
 from gammapy.datasets import SpectrumDatasetOnOff
 from gammapy.maps import RegionGeom, RegionNDMap, WcsGeom, WcsNDMap
 from ..core import Maker
-from ..utils import make_counts_off_rad_max
+from ..utils import make_counts_off_rad_max, make_acceptance
 
 __all__ = [
     "ReflectedRegionsBackgroundMaker",
@@ -452,6 +452,8 @@ class ReflectedRegionsBackgroundMaker(Maker):
         self,
         region_finder=None,
         exclusion_mask=None,
+        compute_acceptance: bool = False,
+        background_normalisation_range=[0.35 * u.deg, 0.65 * u.deg],
         **kwargs,
     ):
         if exclusion_mask and not exclusion_mask.is_mask:
@@ -472,6 +474,9 @@ class ReflectedRegionsBackgroundMaker(Maker):
             if kwargs:
                 raise ValueError("No kwargs can be given if providing a region_finder")
             self.region_finder = region_finder
+
+        self.compute_acceptance = compute_acceptance
+        self._background_normalisation_range = background_normalisation_range
 
     @staticmethod
     def _filter_regions_off_rad_max(regions_off, energy_axis, geom, events, rad_max):
@@ -531,6 +536,12 @@ class ReflectedRegionsBackgroundMaker(Maker):
                 f" got {type(geom.region)} instead"
             )
 
+        if np.max(rad_max.quantity) > self._background_normalisation_range[0]:
+            raise ValueError(
+                f"the maximum of the rad_max values is larger than the lower edge of background normalisation range "
+                f"{self._background_normalisation_range[0]}."
+            )
+
         regions_off, wcs = self.region_finder.run(
             center=observation.get_pointing_icrs(observation.tmid),
             region=geom.region,
@@ -565,7 +576,15 @@ class ReflectedRegionsBackgroundMaker(Maker):
             counts_off = RegionNDMap.from_geom(geom=geom_off)
             counts_off.fill_events(events)
 
-        acceptance_off = RegionNDMap.from_geom(geom=geom_off, data=len(regions_off))
+        if self.compute_acceptance:
+            acceptance_off = make_acceptance(
+                geom=geom_off,
+                rad_min=self._background_normalisation_range[0],
+                rad_max=self._background_normalisation_range[1],
+                events=events,
+            )
+        else:
+            acceptance_off = RegionNDMap.from_geom(geom=geom_off, data=len(regions_off))
 
         return counts_off, acceptance_off
 
@@ -585,7 +604,19 @@ class ReflectedRegionsBackgroundMaker(Maker):
             On-Off dataset.
         """
         counts_off, acceptance_off = self.make_counts_off(dataset, observation)
-        acceptance = RegionNDMap.from_geom(geom=dataset.counts.geom, data=1)
+        if self.compute_acceptance:
+            log.debug(
+                f"Computed acceptance for {dataset.name} with "
+                f"background normalisation range {self._background_normalisation_range}"
+            )
+            acceptance = make_acceptance(
+                geom=dataset.counts.geom,
+                rad_min=self._background_normalisation_range[0],
+                rad_max=self._background_normalisation_range[1],
+                events=observation.events,
+            )
+        else:
+            acceptance = RegionNDMap.from_geom(geom=dataset.counts.geom, data=1)
 
         dataset_onoff = SpectrumDatasetOnOff.from_spectrum_dataset(
             dataset=dataset,
