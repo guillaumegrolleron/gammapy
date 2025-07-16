@@ -585,6 +585,11 @@ class ReflectedRegionsBackgroundMaker(Maker):
             )
         else:
             acceptance_off = RegionNDMap.from_geom(geom=geom_off, data=len(regions_off))
+        if not np.isfinite(acceptance_off).all():
+            log.warning(
+                f"ReflectedRegionsBackgroundMaker failed. Acceptance for {dataset.name} is not finite."
+            )
+            acceptance_off = RegionNDMap.from_geom(geom=geom_off, data=1)
 
         return counts_off, acceptance_off
 
