@@ -114,7 +114,7 @@ class EDispMap(IRFMap):
         edisp_kernel_map = edisp_map.to_edisp_kernel_map(energy_axis=energy_axis)
         return edisp_kernel_map.get_edisp_kernel()
 
-    def to_edisp_kernel_map(self, energy_axis):
+    def to_edisp_kernel_map(self, energy_axis, bias=1):
         """Convert to map with energy dispersion kernels.
 
         Parameters
@@ -138,7 +138,7 @@ class EDispMap(IRFMap):
             mode = "edges"
         coords = geom.get_coord(sparse=True, mode=mode, axis_name="energy")
 
-        migra = coords["energy"] / coords["energy_true"]
+        migra = bias * coords["energy"] / coords["energy_true"]
 
         coords = {
             "skycoord": coords.skycoord,

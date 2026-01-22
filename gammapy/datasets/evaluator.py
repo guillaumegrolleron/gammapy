@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from gammapy.irf import EDispKernel, PSFKernel
 from gammapy.maps import HpxNDMap, Map, RegionNDMap, WcsNDMap
 from gammapy.modeling.models import PointSpatialModel, TemplateNPredModel
+from .evaluator_core import Evaluator
 from .utils import apply_edisp
 
 PSF_MAX_RADIUS = None
@@ -19,7 +20,7 @@ CUTOUT_MARGIN = 0.1 * u.deg
 log = logging.getLogger(__name__)
 
 
-class MapEvaluator:
+class MapEvaluator(Evaluator):
     """Sky model evaluation on maps.
 
     Evaluates a sky model on a 3D map and returns a map of the predicted counts.
@@ -60,6 +61,7 @@ class MapEvaluator:
         mask=None,
         evaluation_mode="local",
         use_cache=True,
+        bias_parameters=None,
     ):
         self.model = model
         self.exposure = exposure
@@ -93,6 +95,8 @@ class MapEvaluator:
         self._cached_position = (0, 0)
         self._computation_cache = None
 
+        super().__init__(bias_parameters=bias_parameters)
+
     def _repr_html_(self):
         try:
             return self.to_html()
@@ -124,24 +128,6 @@ class MapEvaluator:
             energy_axis = self.geom.axes["energy_true"]
         geom = self.geom.to_image().to_cube(axes=[energy_axis.copy(name="energy")])
         return geom
-
-    @property
-    def needs_update(self):
-        """Check whether the model component has drifted away from its support."""
-        if isinstance(self.model, TemplateNPredModel):
-            return False
-        elif not self.contributes:
-            return False
-        elif self.exposure is None:
-            return True
-        elif self.geom.is_region:
-            return False
-        elif self.evaluation_mode == "global" or self.model.evaluation_radius is None:
-            return False
-        elif not self.parameters_spatial_changed(reset=False):
-            return False
-        else:
-            return self.irf_position_changed
 
     @property
     def psf_width(self):

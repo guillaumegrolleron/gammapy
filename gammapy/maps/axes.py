@@ -126,6 +126,7 @@ class MapAxis:
         node_type="edges",
         unit="",
         boundary_type="monotonic",
+        bias=1,
     ):
         if not isinstance(name, str):
             raise TypeError(f"Name must be a string, got: {type(name)!r}")
@@ -171,6 +172,7 @@ class MapAxis:
 
         self._nbin = nbin
         self._use_center_as_plot_labels = None
+        self._bias = bias
 
     def _repr_html_(self):
         try:
@@ -282,11 +284,26 @@ class MapAxis:
         """Name of the axis."""
         return self._name
 
+    @property
+    def bias(self):
+        return self._bias
+
+    @bias.setter
+    def bias(self, value):
+        self._bias = value
+        # Clear cached edges when bias changes
+        if "edges" in self.__dict__:
+            del self.__dict__["edges"]
+        if "center" in self.__dict__:
+            del self.__dict__["center"]
+
     @lazyproperty
     def edges(self):
         """Return an array of bin edges."""
         pix = np.arange(self.nbin + 1, dtype=float) - 0.5
-        return u.Quantity(self.pix_to_coord(pix), self._unit, copy=COPY_IF_NEEDED)
+        return u.Quantity(
+            self.bias * self.pix_to_coord(pix), self._unit, copy=COPY_IF_NEEDED
+        )
 
     @property
     def edges_min(self):
@@ -478,7 +495,9 @@ class MapAxis:
     def center(self):
         """Return an array of bin centers."""
         pix = np.arange(self.nbin, dtype=float)
-        return u.Quantity(self.pix_to_coord(pix), self._unit, copy=COPY_IF_NEEDED)
+        return u.Quantity(
+            self.bias * self.pix_to_coord(pix), self._unit, copy=COPY_IF_NEEDED
+        )
 
     @lazyproperty
     def bin_width(self):
@@ -3304,7 +3323,10 @@ class LabelMapAxis:
     @property
     def center(self):
         """Center of the label axis."""
-        return self._labels * self.unit
+        if isinstance(self._labels[0], str):
+            return self._labels
+        else:
+            return self._labels * self.unit
 
     @property
     def edges(self):

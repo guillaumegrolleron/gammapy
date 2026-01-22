@@ -6,6 +6,7 @@ import numpy as np
 from astropy.table import Table
 from gammapy.utils.pbar import progress_bar
 from gammapy.modeling.utils import _parse_datasets
+from gammapy.modeling.parameter import Parameters
 from .covariance import Covariance
 from .iminuit import (
     confidence_iminuit,
@@ -170,8 +171,14 @@ class Fit:
             datasets=datasets, optimize_result=optimize_result
         )
 
+        subset_indices = [
+            parameters.index(name)
+            for name in datasets.models.parameters.unique_parameters.names
+        ]
+        # if covariance_result.success :
         optimize_result.models.covariance = Covariance(
-            optimize_result.models.parameters, covariance_result.matrix
+            optimize_result.models.parameters,
+            covariance_result.matrix[np.ix_(subset_indices, subset_indices)],
         )
 
         datasets._covariance = Covariance(parameters, covariance_result.matrix)
@@ -264,6 +271,76 @@ class Fit:
             Results.
         """
         datasets, unique_pars = _parse_datasets(datasets=datasets)
+        _param_list = [param for param in datasets.models.parameters]
+        # if datasets.bias_parameters is not None :
+        _param_list.extend([param for param in datasets.bias_parameters])
+        parameters = Parameters(_param_list)
+
+        kwargs = self.covariance_opts.copy()
+
+        if optimize_result is not None and optimize_result.backend == "minuit":
+            kwargs["minuit"] = optimize_result.minuit
+
+        backend = kwargs.pop("backend", self.backend)
+        compute = registry.get("covariance", backend)
+
+        with unique_pars.restore_status():
+            if self.backend == "minuit":
+                method = "hesse"
+            else:
+                method = ""
+
+            factor_matrix, info = compute(
+                parameters=unique_pars, function=datasets.stat_sum, **kwargs
+            )
+            matrix = Covariance.from_factor_matrix(
+                parameters=parameters, matrix=factor_matrix
+            )
+            subset_indices = [
+                parameters.index(name)
+                for name in datasets.models.parameters.free_unique_parameters.names
+            ]
+            if factor_matrix.shape != ():
+                factor_matrix = factor_matrix[np.ix_(subset_indices, subset_indices)]
+            matrix_models = Covariance.from_factor_matrix(
+                parameters=datasets.models.parameters, matrix=factor_matrix
+            )
+
+            datasets.models.covariance = (
+                matrix_models  # Why this line ? it does nothing
+            )
+
+        if optimize_result:
+            optimize_result.models.covariance = matrix_models.data.copy()
+
+        return CovarianceResult(
+            backend=backend,
+            method=method,
+            success=info["success"],
+            message=info["message"],
+            matrix=matrix.data,
+        )
+
+    def covariance_old(self, datasets, optimize_result=None):
+        """Estimate the covariance matrix.
+
+        Assumes that the model parameters are already optimised.
+
+        Parameters
+        ----------
+        datasets : `Datasets` or list of `Dataset`
+            Datasets to optimize.
+        optimize_result : `OptimizeResult`, optional
+            Optimization result. Can be optionally used to pass the state of the IMinuit object
+            to the covariance estimation. This might save computation time in certain cases.
+            Default is None.
+
+        Returns
+        -------
+        result : `CovarianceResult`
+            Results.
+        """
+        datasets, unique_pars = _parse_datasets(datasets=datasets)
         parameters = datasets.models.parameters
 
         kwargs = self.covariance_opts.copy()
@@ -283,7 +360,6 @@ class Fit:
             factor_matrix, info = compute(
                 parameters=unique_pars, function=datasets.stat_sum, **kwargs
             )
-
             matrix = Covariance.from_factor_matrix(
                 parameters=parameters, matrix=factor_matrix
             )

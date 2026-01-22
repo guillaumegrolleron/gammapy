@@ -257,7 +257,7 @@ class PlotMixin:
         ax3.set_title("Energy Dispersion")
 
         if self.edisp is not None:
-            kernel = self.edisp.get_edisp_kernel()
+            kernel = self.edisp.get_edisp_kernel(energy_axis=self._geom.axes["energy"])
             kernel.plot_matrix(ax=ax3, add_cbar=True)
 
 

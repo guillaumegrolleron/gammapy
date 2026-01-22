@@ -10,6 +10,7 @@ from gammapy.maps import Map
 from gammapy.modeling.models import PointSpatialModel, TemplateNPredModel
 from gammapy.utils.integrate import integrate_histogram
 from .utils import apply_edisp
+from .evaluator_core import Evaluator
 
 PSF_MAX_RADIUS = None
 PSF_CONTAINMENT = 0.999
@@ -18,7 +19,7 @@ CUTOUT_MARGIN = 0.1 * u.deg
 log = logging.getLogger(__name__)
 
 
-class UnbinnedEvaluator:
+class UnbinnedEvaluator(Evaluator):
     """Sky model evaluation on maps.
 
     Evaluates a sky model on a 3D map and returns a map of the predicted counts.
@@ -53,7 +54,6 @@ class UnbinnedEvaluator:
         geom,
         geom_normalization,
         exposure=None,
-        # exposure_original_irf=None,
         psf=None,
         edisp=None,
         edisp_e_reco_binned=None,
@@ -61,6 +61,7 @@ class UnbinnedEvaluator:
         mask=None,
         evaluation_mode="local",
         use_cache=True,
+        bias_parameters=None,
     ):
         self.model = model
         self.exposure = exposure
@@ -94,14 +95,15 @@ class UnbinnedEvaluator:
         self._cached_position = (0, 0)
         self._computation_cache = None
 
+        super().__init__(bias_parameters=bias_parameters)
+
         self.update(
-            exposure,
-            psf,
-            edisp,
-            geom,
-            mask,
+            exposure=exposure,
+            psf=psf,
+            edisp=edisp,
+            geom=geom,
+            mask=mask,
             edisp_e_reco_binned=edisp_e_reco_binned,
-            # exposure_original_irf=exposure_original_irf,
         )
 
     def _repr_html_(self):
@@ -134,22 +136,6 @@ class UnbinnedEvaluator:
             energy_axis = self.geom.axes["energy_true"].copy(name="energy")
         geom = self.geom.to_image().to_cube(axes=[energy_axis])
         return geom
-
-    @property
-    def needs_update(self):
-        """Check whether the model component has drifted away from its support."""
-        if isinstance(self.model, TemplateNPredModel):
-            return False
-        elif not self.contributes:
-            return False
-        elif self.geom.is_region:
-            return False
-        elif self.evaluation_mode == "global" or self.model.evaluation_radius is None:
-            return False
-        elif not self.parameters_spatial_changed(reset=False):
-            return False
-        else:
-            return self.irf_position_changed
 
     @property
     def psf_width(self):
@@ -186,8 +172,7 @@ class UnbinnedEvaluator:
         edisp,
         geom,
         mask,
-        edisp_e_reco_binned=None,
-        # exposure_original_irf=None,
+        edisp_e_reco_binned,
     ):
         """Update MapEvaluator, based on the current position of the model component.
 
@@ -203,6 +188,8 @@ class UnbinnedEvaluator:
             Counts geom.
         mask : `~gammapy.maps.Map`
             Mask to apply to the likelihood for fitting.
+        bias_parameters : `gammapy.modeling.Parameters`
+            Bias parameters to take into account in the evaluation.
         """
         # TODO: simplify and clean up
         log.debug("Updating model evaluator")
@@ -220,7 +207,6 @@ class UnbinnedEvaluator:
                 position=self.position, energy_axis=energy_axis
             )
             del self._edisp_diagonal
-
         else:
             self.edisp = None
         if edisp_e_reco_binned is not None:

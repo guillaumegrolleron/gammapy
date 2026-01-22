@@ -5,8 +5,8 @@ from astropy import units as u
 from astropy.coordinates import Angle
 from gammapy.irf import EDispKernelMap
 from gammapy.maps import Map
-from gammapy.datasets import EventDatasetOnOff
-from gammapy.modeling.models import TemplateSpectralModel, GaussianPrior
+from gammapy.datasets import EventDataset
+from gammapy.modeling.models import TemplateSpectralModel
 from .core import Maker
 
 __all__ = ["SafeMaskMaker"]
@@ -272,9 +272,10 @@ class SafeMaskMaker(Maker):
             raise ValueError(
                 f"{observation} argument is mandatory with {self.fixed_offset}"
             )
-
-        edisp, geom = dataset.edisp, dataset._geom
-
+        if isinstance(dataset, EventDataset):
+            edisp, geom = dataset.edisp_e_reco_binned, dataset._geom
+        else:
+            edisp, geom = dataset.edisp, dataset._geom
         if self.irfs == "DL3":
             offset = self._get_offset(observation)
             edisp = observation.edisp.to_edisp_kernel(offset)
@@ -282,7 +283,10 @@ class SafeMaskMaker(Maker):
             kwargs = dict()
             kwargs["position"] = self._get_position(observation, geom)
             if not isinstance(edisp, EDispKernelMap):
-                kwargs["energy_axis"] = dataset._geom.axes["energy"]
+                if isinstance(dataset, EventDataset):
+                    kwargs["energy_axis"] = dataset.geom_normalization.axes["energy"]
+                else:
+                    kwargs["energy_axis"] = dataset._geom.axes["energy"]
             edisp = edisp.get_edisp_kernel(**kwargs)
         energy_min = edisp.get_bias_energy(self.bias_percent / 100)[0]
         return geom.energy_mask(energy_min=energy_min)
@@ -320,8 +324,14 @@ class SafeMaskMaker(Maker):
             background_spectrum = dataset.npred_background().get_spectrum()
             energy_axis = geom.axes["energy"]
 
-        idx = np.argmax(background_spectrum.data, axis=0).item()
-        return geom.energy_mask(energy_min=energy_axis.edges[idx])
+        if geom.is_unbinned:
+            raise ValueError("bkg-peak method not implemented for unbinned datasets")
+            energy_min = energy_axis.center[idx]
+        else:
+            idx = np.argmax(background_spectrum.data, axis=0).item()
+            energy_min = energy_axis.edges[idx]
+
+        return geom.energy_mask(energy_min=energy_min)
 
     @staticmethod
     def make_mask_bkg_invalid(dataset):
@@ -389,17 +399,4 @@ class SafeMaskMaker(Maker):
             mask_safe &= self.make_mask_energy_bkg_peak(dataset, observation)
 
         dataset.mask_safe = Map.from_geom(dataset._geom, data=mask_safe, dtype=bool)
-        if isinstance(dataset, EventDatasetOnOff) and dataset.mask_safe.data.sum() != 0:
-            log.debug("applying prior on the background model based on safe mask")
-            mu = (
-                len(dataset.events_off_safe.energy)
-                * np.mean(dataset.alpha.data)
-                / dataset.background_model.integral(
-                    energy_min=dataset.events_off_safe.energy.min(),
-                    energy_max=dataset.events_off_safe.energy.max(),
-                )
-            )
-            dataset.background_model.norm.prior = GaussianPrior(
-                mu=mu, sigma=np.abs(1 - mu)
-            )
         return dataset

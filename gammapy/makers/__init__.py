@@ -16,6 +16,7 @@ from .reduce import DatasetsMaker
 from .safe import SafeMaskMaker
 from .spectrum import SpectrumDatasetMaker
 from .events import EventDatasetMaker
+from .irf_bias import IRFBiasMaker
 
 MAKER_REGISTRY = Registry(
     [
@@ -29,6 +30,7 @@ MAKER_REGISTRY = Registry(
         SafeMaskMaker,
         DatasetsMaker,
         EventDatasetMaker,
+        IRFBiasMaker,
     ]
 )
 """Registry of maker classes in Gammapy."""
@@ -49,4 +51,5 @@ __all__ = [
     "SpectrumDatasetMaker",
     "WobbleRegionsFinder",
     "EventDatasetMaker",
+    "IRFBiasMaker",
 ]

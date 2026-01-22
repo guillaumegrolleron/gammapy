@@ -5,12 +5,20 @@ from scipy.stats import median_abs_deviation as mad
 import astropy.units as u
 from astropy.io import fits
 from astropy.table import Table
+from astropy.utils import lazyproperty
 from regions import CircleSkyRegion, RectangleSkyRegion
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import gammapy.datasets.evaluator as meval
 from gammapy.data import GTI, PointingMode
-from gammapy.irf import EDispKernelMap, EDispMap, PSFKernel, PSFMap, RecoPSFMap
+from gammapy.irf import (
+    EDispKernelMap,
+    EDispKernel,
+    EDispMap,
+    PSFKernel,
+    PSFMap,
+    RecoPSFMap,
+)
 from gammapy.maps import LabelMapAxis, Map, MapAxes, MapAxis, WcsGeom
 from gammapy.modeling.models import DatasetModels, FoVBackgroundModel, Models
 from gammapy.stats import (
@@ -22,7 +30,7 @@ from gammapy.utils.fits import HDULocation, LazyFitsData
 from gammapy.utils.random import get_random_state
 from gammapy.utils.scripts import make_name, make_path
 from gammapy.utils.table import hstack_columns
-from .core import Dataset
+from .core import Dataset, VALID_BIAS_PARAMETER_NAMES
 from .evaluator import MapEvaluator
 from .metadata import MapDatasetMetaData
 from .utils import get_axes
@@ -43,7 +51,7 @@ RAD_AXIS_DEFAULT = MapAxis.from_bounds(
     0, RAD_MAX, nbin=66, node_type="edges", name="rad", unit="deg"
 )
 MIGRA_AXIS_DEFAULT = MapAxis.from_bounds(
-    0.2, 5, nbin=48, node_type="edges", name="migra"
+    0.1, 3, nbin=300, node_type="edges", name="migra"
 )
 
 BINSZ_IRF_DEFAULT = 0.2 * u.deg
@@ -688,10 +696,41 @@ class MapDataset(Dataset):
                         evaluation_mode=EVALUATION_MODE,
                         gti=self.gti,
                         use_cache=USE_NPRED_CACHE,
+                        bias_parameters=self.bias_parameters
+                        if hasattr(self, "bias_parameters")
+                        else None,
                     )
                     self._evaluators[model.name] = evaluator
 
         self._models = models
+
+    @lazyproperty
+    def __edisp_kernel_map(self):
+        if isinstance(self.edisp, (EDispKernelMap, EDispKernel)):
+            if hasattr(self, "energy_reco_bias") and self.energy_reco_bias is not None:
+                log.warning(
+                    "Energy bias is not applied to edisp because\
+                        energy dispersion is already a kernel. Please Check your edisp geometry in DatasetMaker."
+                )
+            return self.edisp
+        else:
+            energy_axes = self._geom.axes["energy"]
+            bias = (
+                self.energy_reco_bias.value
+                if hasattr(self, "energy_reco_bias")
+                and self.energy_reco_bias is not None
+                else 1.0
+            )
+            self._bias_cached = bias
+            return self.edisp.to_edisp_kernel_map(energy_axes, bias=bias)
+
+    @property
+    def edisp_kernel_map(self):
+        """Energy dispersion kernel map for binned energy axis."""
+        if self._energy_reco_bias_has_changed:
+            if "__edisp_kernel_map" in self.__dict__:
+                del self.__dict__["__edisp_kernel_map"]
+        return self.__edisp_kernel_map
 
     @property
     def evaluators(self):
@@ -858,7 +897,7 @@ class MapDataset(Dataset):
                 evaluator.update(
                     self.exposure,
                     self.psf,
-                    self.edisp,
+                    self.edisp_kernel_map,
                     self._geom,
                     self.mask_image,
                 )
@@ -1062,11 +1101,13 @@ class MapDataset(Dataset):
         if self.mask_safe is None or self.edisp is None:
             return None
 
-        if self.mask_safe.geom.is_region:
-            return self.mask_safe
-
         geom = self.edisp.edisp_map.geom.squash("energy_true")
-
+        if self.mask_safe.geom.is_region:
+            if "migra" in geom.axes.names:
+                return None
+            else:
+                return self.mask_safe
+        # For EDispMap (with migra axis)
         if "migra" in geom.axes.names:
             geom = geom.squash("migra")
             mask_safe_edisp = self.mask_safe_image.interp_to_geom(
@@ -1201,6 +1242,17 @@ class MapDataset(Dataset):
 
         if self.meta and other.meta:
             self.meta.stack(other.meta)
+
+        if hasattr(other, "bias_parameters"):
+            for parameter in other.bias_parameters:
+                if parameter.name in VALID_BIAS_PARAMETER_NAMES:
+                    bias_parameter = getattr(self, parameter.name, None)
+                    if bias_parameter is None:
+                        setattr(self, parameter.name, parameter.copy())
+                    else:
+                        logging.debug(
+                            f"Bias parameter {parameter.name} already exists in the dataset. Keeping the existing one."
+                        )
 
     def residuals(self, method="diff", **kwargs):
         """Compute residuals map.
@@ -1941,8 +1993,9 @@ class MapDataset(Dataset):
 
         if self.stat_type == "cash":
             kwargs["background"] = dataset.background
-
-        return SpectrumDataset(**kwargs)
+        out = SpectrumDataset(**kwargs)
+        out = dataset._propagate_needed_members(out)
+        return out
 
     def to_region_map_dataset(self, region, name=None):
         """Integrate the map dataset in a given region.
@@ -2675,9 +2728,13 @@ class MapDatasetOnOff(MapDataset):
         alpha : `Map`
             Alpha map.
         """
+        if hasattr(self, "background_bias"):
+            background_bias = self.background_bias.value
+        else:
+            background_bias = 1.0
         with np.errstate(invalid="ignore", divide="ignore"):
             data = self.acceptance.quantity / self.acceptance_off.quantity
-        data = np.nan_to_num(data)
+        data = background_bias * np.nan_to_num(data)
 
         return Map.from_geom(self._geom, data=data.to_value(""), unit="")
 
@@ -2691,12 +2748,17 @@ class MapDatasetOnOff(MapDataset):
         npred_background : `Map`
             Predicted background counts.
         """
+        # if hasattr(self, "background_bias"):
+        #    background_bias = self.background_bias.value
+        # else :
+        #    background_bias = 1.0
         mu_bkg = self.alpha.data * get_wstat_mu_bkg(
             n_on=self.counts.data,
             n_off=self.counts_off.data,
             alpha=self.alpha.data,
             mu_sig=self.npred_signal().data,
         )
+
         mu_bkg = np.nan_to_num(mu_bkg)
         return Map.from_geom(geom=self._geom, data=mu_bkg)
 
@@ -2823,7 +2885,7 @@ class MapDatasetOnOff(MapDataset):
         if np.isscalar(acceptance_off):
             acceptance_off = Map.from_geom(dataset._geom, data=acceptance_off)
 
-        return cls(
+        out = cls(
             models=dataset.models,
             counts=dataset.counts,
             exposure=dataset.exposure,
@@ -2838,6 +2900,8 @@ class MapDatasetOnOff(MapDataset):
             name=name,
             meta_table=dataset.meta_table,
         )
+        out = dataset._propagate_needed_members(out)
+        return out
 
     def to_map_dataset(self, name=None):
         """Convert a MapDatasetOnOff to a MapDataset.
@@ -2858,7 +2922,7 @@ class MapDatasetOnOff(MapDataset):
 
         background = self.counts_off * self.alpha if self.counts_off else None
 
-        return MapDataset(
+        out = MapDataset(
             counts=self.counts,
             exposure=self.exposure,
             psf=self.psf,
@@ -2870,6 +2934,8 @@ class MapDatasetOnOff(MapDataset):
             background=background,
             meta_table=self.meta_table,
         )
+        out = self._propagate_needed_members(out)
+        return out
 
     def _to_asimov_dataset(self):
         """Create Asimov dataset from the current models."""

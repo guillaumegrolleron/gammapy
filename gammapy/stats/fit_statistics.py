@@ -454,6 +454,8 @@ def unbinned_likelihood(signal_pdf, bkg_pdf, mu_sig, mu_bkg, n_on, n_off):
     if mu_sig < 0:
         return np.array([1e100])
     ws = mu_sig / (mu_sig + mu_bkg)
+    if ((ws * signal_pdf + (1 - ws) * bkg_pdf) < 0).any():
+        return np.array([1e100])
     sum_term = np.sum(np.log((ws * signal_pdf + (1 - ws) * bkg_pdf)))
     sum_term = np.nan_to_num(sum_term, nan=-1e100, posinf=-1e100, neginf=-1e100)
 

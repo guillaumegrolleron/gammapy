@@ -2,18 +2,20 @@
 import numpy as np
 import logging
 from astropy import units as u
+from astropy.utils import lazyproperty
 import matplotlib.pyplot as plt
 from gammapy.modeling.models import (
     DatasetModels,
     FoVBackgroundModel,
     NormBackgroundSpectralModel,
     Models,
+    GaussianPrior,
 )
 from gammapy.utils.scripts import make_name
 from gammapy.utils.fits import LazyFitsData, HDULocation
 from gammapy.utils.integrate import integrate_histogram
-from gammapy.irf import EDispMap, EDispKernelMap, PSFMap, RecoPSFMap
-from gammapy.maps import Map, MapAxes, LabelMapAxis
+from gammapy.irf import EDispMap, EDispKernel, EDispKernelMap, PSFMap, RecoPSFMap
+from gammapy.maps import Map, MapAxes, LabelMapAxis, MapAxis
 from gammapy.data import GTI
 from .unbinned_evaluator import UnbinnedEvaluator
 from .core import Dataset
@@ -25,6 +27,10 @@ log = logging.getLogger(__name__)
 EVALUATION_MODE = "local"
 USE_NPRED_CACHE = True
 
+ENERGY_AXIS_DEFAULT = MapAxis.from_energy_bounds(
+    0.01, 300, nbin=10, per_decade=True, unit="TeV", name="energy"
+)
+
 
 class EventDataset(Dataset, PlotMixin):
     """ """
@@ -35,7 +41,7 @@ class EventDataset(Dataset, PlotMixin):
     background = LazyFitsData(cache=True)
     psf = LazyFitsData(cache=True)
     mask_fit = LazyFitsData(cache=True)
-    mask_safe = LazyFitsData(cache=True)
+    _mask_safe = LazyFitsData(cache=True)
 
     _lazy_data_members = [
         "background",
@@ -43,7 +49,7 @@ class EventDataset(Dataset, PlotMixin):
         "edisp",
         "psf",
         "mask_fit",
-        "mask_safe",
+        "_mask_safe",
     ]
 
     gti = None
@@ -66,8 +72,6 @@ class EventDataset(Dataset, PlotMixin):
         reference_time="2000-01-01",
         gti=None,
         meta=None,
-        edisp_e_reco_binned=None,
-        # exposure_original_irf=None,
     ):
         self._name = make_name(name)
         self._evaluators = {}
@@ -103,18 +107,95 @@ class EventDataset(Dataset, PlotMixin):
                 "'edisp' must be a 'EDispMap', `EDispKernelMap` or 'HDULocation' "
                 f"object, got `{type(edisp)}` instead."
             )
-        if edisp_e_reco_binned is not None and not isinstance(
-            edisp_e_reco_binned, (EDispMap, EDispKernelMap, HDULocation)
-        ):
-            raise ValueError(
-                "'edisp_e_reco_binned' must be a 'EDispMap', `EDispKernelMap` or 'HDULocation' "
-                f"object, got `{type(edisp_e_reco_binned)}` instead."
-            )
+        # if edisp_e_reco_binned is not None and not isinstance(
+        #    edisp_e_reco_binned, (EDispMap, EDispKernelMap, HDULocation)
+        # ):
+        #    raise ValueError(
+        #        "'edisp_e_reco_binned' must be a 'EDispMap', `EDispKernelMap` or 'HDULocation' "
+        #        f"object, got `{type(edisp_e_reco_binned)}` instead."
+        #    )
 
         self.edisp = edisp
         self.meta = meta
-        self.edisp_e_reco_binned = edisp_e_reco_binned
+        # self.edisp_e_reco_binned = edisp_e_reco_binned
         # self.exposure_original_irf = exposure_original_irf
+
+    @property
+    def mask_safe(self):
+        """Getter for mask_safe"""
+        return self._mask_safe
+
+    @mask_safe.setter
+    def mask_safe(self, value):
+        """Setter for mask_safe with custom processing"""
+        self._mask_safe = value
+
+    @lazyproperty
+    def __edisp_e_reco_binned(self):
+        if isinstance(self.edisp, (EDispKernelMap, EDispKernel)):
+            if hasattr(self, "energy_reco_bias") and self.energy_reco_bias is not None:
+                log.warning(
+                    "Energy bias is not applied to edisp_e_reco_binned because\
+                        energy dispersion is already a kernel. Please Check your EventDatasetMaker."
+                )
+            return self.edisp
+        else:
+            energy_axes = self.geom_normalization.axes["energy"]
+            bias = (
+                self.energy_reco_bias.value
+                if hasattr(self, "energy_reco_bias")
+                and self.energy_reco_bias is not None
+                else 1.0
+            )
+            self._bias_cached = bias
+            return self.edisp.to_edisp_kernel_map(energy_axes, bias=bias)
+
+    @property
+    def edisp_e_reco_binned(self):
+        """Energy dispersion kernel map for binned energy axis."""
+        if self._energy_reco_bias_has_changed:
+            if "__edisp_e_reco_binned" in self.__dict__:
+                del self.__dict__["__edisp_e_reco_binned"]
+        return self.__edisp_e_reco_binned
+
+    @lazyproperty
+    def __edisp_kernel_unbinned(self):
+        """Energy dispersion kernel map for unbinned energy axis."""
+        edisp_e_reco_binned = self.edisp_e_reco_binned
+        axes = self.geom.axes + [edisp_e_reco_binned.edisp_map.geom.axes["energy_true"]]
+        new_geom = self.geom.to_image().to_cube(axes=axes)
+        differencial_edisp_map_e_reco_binned = (
+            edisp_e_reco_binned.edisp_map.divide_bin_width("energy")
+        )
+        edisp_map_iterpolated = differencial_edisp_map_e_reco_binned.interp_to_geom(
+            geom=new_geom
+        )
+        edisp = EDispKernelMap(
+            edisp_kernel_map=edisp_map_iterpolated,
+            exposure_map=edisp_e_reco_binned.exposure_map,
+        )
+        normalization = integrate_histogram(
+            differencial_edisp_map_e_reco_binned.quantity,
+            edisp_e_reco_binned.edisp_map.geom.axes["energy"].edges,
+            self.geom.axes["energy"].center.min(),
+            self.geom.axes["energy"].center.max(),
+            axis=differencial_edisp_map_e_reco_binned.geom.axes.index_data("energy"),
+        )[0]
+        normalization_inv = np.nan_to_num(normalization**-1, posinf=1)
+        edisp.edisp_map.quantity = (
+            np.einsum("trxy,txy->trxy", edisp.edisp_map.data, normalization_inv)
+            * edisp.edisp_map.unit
+            * normalization_inv.unit
+        )
+        return edisp
+
+    @property
+    def edisp_kernel_unbinned(self):
+        """Energy dispersion kernel map for unbinned energy axis."""
+        if self._energy_reco_bias_has_changed:
+            if "__edisp_kernel_unbinned" in self.__dict__:
+                del self.__dict__["__edisp_kernel_unbinned"]
+        return self.__edisp_kernel_unbinned
 
     @property
     def _geom(self):
@@ -148,13 +229,15 @@ class EventDataset(Dataset, PlotMixin):
                         geom=self.geom,
                         geom_normalization=self.geom_normalization,
                         psf=self.psf,
-                        edisp=self.edisp,
+                        edisp=self.edisp_kernel_unbinned,
                         edisp_e_reco_binned=self.edisp_e_reco_binned,
                         exposure=self.exposure,
-                        # exposure_original_irf=self.exposure_original_irf,
                         evaluation_mode=EVALUATION_MODE,
                         gti=self.gti,
                         use_cache=USE_NPRED_CACHE,
+                        bias_parameters=self.bias_parameters
+                        if hasattr(self, "bias_parameters")
+                        else None,
                     )
                     self._evaluators[model.name] = evaluator
         self._models = models
@@ -184,7 +267,7 @@ class EventDataset(Dataset, PlotMixin):
     def peek(self, figsize=(16, 4)):
         """Quick-look summary plots.
 
-        This method creates a figure displaying the elements of your `SpectrumDataset`.
+        This method creates a figure displaying the elements of your `EventDataset`.
         For example:
 
         * Exposure map
@@ -204,8 +287,7 @@ class EventDataset(Dataset, PlotMixin):
         ax2.set_title("Energy Dispersion")
 
         if self.edisp_e_reco_binned is not None:
-            kernel = self.edisp_e_reco_binned.get_edisp_kernel()
-            kernel.plot_matrix(ax=ax2, add_cbar=True)
+            self.edisp_e_reco_binned.plot_matrix(ax=ax2, add_cbar=True)
 
     @property
     def events_safe(self):
@@ -224,6 +306,159 @@ class EventDataset(Dataset, PlotMixin):
             return mask
 
         return self.mask.reduce_over_axes(func=np.logical_or)
+
+    @property
+    def geoms(self):  # DUPLICATE OF MAPDATASET
+        """Map geometries.
+
+        Returns
+        -------
+        geoms : dict
+            Dictionary of map geometries involved in the dataset.
+        """
+        geoms = {}
+
+        geoms["geom"] = self._geom
+        geoms["geom_normalization"] = self.geom_normalization
+
+        if self.exposure:
+            geoms["geom_exposure"] = self.exposure.geom
+
+        if self.psf:
+            geoms["geom_psf"] = self.psf.psf_map.geom
+
+        if self.edisp:
+            geoms["geom_edisp"] = self.edisp.edisp_map.geom
+
+        return geoms
+
+    def to_masked(self, name=None, nan_to_num=True):
+        """Return masked dataset.
+
+        Parameters
+        ----------
+        name : str, optional
+            Name of the masked dataset. Default is None.
+        nan_to_num : bool
+            Non-finite values are replaced by zero if True. Default is True.
+
+        Returns
+        -------
+        dataset : `MapDataset` or `SpectrumDataset`
+            Masked dataset.
+        """
+        dataset = self.__class__.from_geoms(**self.geoms, name=name)
+        dataset.stack(self, nan_to_num=nan_to_num)
+        return dataset
+
+    def stack(self, other, nan_to_num=True):
+        r"""Stack another dataset in place. The original dataset is modified.
+
+        Safe mask is applied to the other dataset to compute the stacked counts data.
+        Counts outside the safe mask are lost.
+
+        Note that the masking is not applied to the current dataset. If masking needs
+        to be applied to it, use `~gammapy.MapDataset.to_masked()` first.
+
+        The stacking of 2 datasets is implemented as follows. Here, :math:`k`
+        denotes a bin in reconstructed energy and :math:`j = {1,2}` is the dataset number.
+
+        The ``mask_safe`` of each dataset is defined as:
+
+        .. math::
+
+            \epsilon_{jk} =\left\{\begin{array}{cl} 1, &
+            \mbox{if bin k is inside the thresholds}\\ 0, &
+            \mbox{otherwise} \end{array}\right.
+
+        Then the total ``counts`` and model background ``bkg`` are computed according to:
+
+        .. math::
+
+            \overline{\mathrm{n_{on}}}_k =  \mathrm{n_{on}}_{1k} \cdot \epsilon_{1k} +
+             \mathrm{n_{on}}_{2k} \cdot \epsilon_{2k}.
+
+            \overline{bkg}_k = bkg_{1k} \cdot \epsilon_{1k} +
+             bkg_{2k} \cdot \epsilon_{2k}.
+
+        The stacked ``safe_mask`` is then:
+
+        .. math::
+
+            \overline{\epsilon_k} = \epsilon_{1k} OR \epsilon_{2k}.
+
+        For details, see :ref:`stack`.
+
+        Parameters
+        ----------
+        other : `~gammapy.datasets.MapDataset` or `~gammapy.datasets.MapDatasetOnOff`
+            Map dataset to be stacked with this one. If other is an on-off
+            dataset alpha * counts_off is used as a background model.
+        nan_to_num : bool
+            Non-finite values are replaced by zero if True. Default is True.
+
+        """
+
+        if self.exposure and other.exposure:
+            self.exposure.stack(
+                other.exposure, weights=other.mask_safe_image, nan_to_num=nan_to_num
+            )
+            # TODO: check whether this can be improved e.g. handling this in GTI
+
+            if "livetime" in other.exposure.meta and np.any(other.mask_safe_image):
+                if "livetime" in self.exposure.meta:
+                    self.exposure.meta["livetime"] += other.exposure.meta["livetime"]
+                else:
+                    self.exposure.meta["livetime"] = other.exposure.meta[
+                        "livetime"
+                    ].copy()
+
+        if self.stat_type == "cash":
+            if self.background and other.background:
+                background = self.npred_background()
+                background.stack(
+                    other.npred_background(),
+                    weights=other.mask_safe,
+                    nan_to_num=nan_to_num,
+                )
+                self.background = background
+
+        if self.psf and other.psf:
+            self.psf.stack(other.psf, weights=other.mask_safe_psf)
+
+        if self.edisp and other.edisp:
+            self.edisp.stack(other.edisp, weights=other.mask_safe_edisp)
+
+        if self.mask_safe and other.mask_safe:
+            self.mask_safe.stack(other.mask_safe)
+
+        if self.mask_fit and other.mask_fit:
+            self.mask_fit.stack(other.mask_fit)
+        elif other.mask_fit:
+            self.mask_fit = other.mask_fit.copy()
+
+        if self.gti and other.gti:
+            self.gti.stack(other.gti)
+            self.gti = self.gti.union()
+
+        if self.meta_table and other.meta_table:
+            self.meta_table = hstack_columns(self.meta_table, other.meta_table)
+        elif other.meta_table:
+            self.meta_table = other.meta_table.copy()
+
+        if self.meta and other.meta:
+            self.meta.stack(other.meta)
+
+        if hasattr(other, "bias_parameters"):
+            for parameter in other.bias_parameters:
+                if parameter.name in VALID_BIAS_PARAMETER_NAMES:
+                    bias_parameter = getattr(self, parameter.name, None)
+                    if bias_parameter is None:
+                        setattr(self, parameter.name, parameter.copy())
+                    else:
+                        logging.debug(
+                            f"Bias parameter {parameter.name} already exists in the dataset. Keeping the existing one."
+                        )
 
     @classmethod
     def create(
@@ -341,11 +576,12 @@ class EventDataset(Dataset, PlotMixin):
         for evaluator_name, evaluator in evaluators.items():
             if evaluator.needs_update:
                 evaluator.update(
-                    self.exposure,
-                    self.psf,
-                    self.edisp,
-                    self._geom,
-                    self.mask_image,
+                    exposure=self.exposure,
+                    psf=self.psf,
+                    edisp=self.edisp_kernel_unbinned,
+                    edisp_e_reco_binned=self.edisp_e_reco_binned,
+                    geom=self._geom,
+                    mask=self.mask,
                 )
             if evaluator.contributes:
                 npred = evaluator.compute_npred()
@@ -408,8 +644,10 @@ def create_event_dataset_geoms(
     dict
         Dictionary of geometries.
     """
-    rad_axis = rad_axis or RAD_AXIS_DEFAULT
-    migra_axis = migra_axis or MIGRA_AXIS_DEFAULT
+    if rad_axis is None:
+        rad_axis = RAD_AXIS_DEFAULT
+    if migra_axis is None:
+        migra_axis = MIGRA_AXIS_DEFAULT
 
     if energy_axis_true is not None:
         energy_axis_true.assert_name("energy_true")
@@ -470,6 +708,33 @@ class EventDatasetOnOff(EventDataset):
             _models = [bkg_model]
         self.models = DatasetModels(_models)
 
+    def to_masked(self, name=None, nan_to_num=True):
+        """Return masked dataset.
+
+        Parameters
+        ----------
+        name : str, optional
+            Name of the masked dataset. Default is None.
+        nan_to_num : bool
+            Non-finite values are replaced by zero if True. Default is True.
+
+        Returns
+        -------
+        dataset : `MapDataset` or `SpectrumDataset`
+            Masked dataset.
+        """
+        dataset = self.__class__.from_geoms(
+            **self.geoms,
+            name=name,
+            events=self.events,
+            events_off=self.events_off,
+            acceptance=self.acceptance,
+            acceptance_off=self.acceptance_off,
+            stat_type=self.stat_type,
+        )
+        dataset.stack(self, nan_to_num=nan_to_num)
+        return dataset
+
     @classmethod
     def from_eventdataset(
         cls,
@@ -484,7 +749,7 @@ class EventDatasetOnOff(EventDataset):
         if np.isscalar(acceptance_off):
             acceptance_off = Map.from_geom(dataset._geom, data=acceptance_off)
 
-        return cls(
+        out = cls(
             events=dataset.events,
             geom=dataset.geom,
             geom_normalization=dataset.geom_normalization,
@@ -499,11 +764,12 @@ class EventDatasetOnOff(EventDataset):
             reference_time=dataset.reference_time,
             gti=dataset.gti,
             meta=dataset.meta,
-            edisp_e_reco_binned=dataset.edisp_e_reco_binned,
             acceptance=acceptance,
             acceptance_off=acceptance_off,
             events_off=events_off,
         )
+        out = dataset._propagate_needed_members(out)
+        return out
 
     @property
     def alpha(self):
@@ -520,6 +786,8 @@ class EventDatasetOnOff(EventDataset):
         # log.warning("Alpha is not binned, this should be changed.")
         with np.errstate(invalid="ignore", divide="ignore"):
             data = self.acceptance.quantity / self.acceptance_off.quantity
+        if hasattr(self, "background_bias"):
+            data = self.background_bias.value * data
         data = np.nan_to_num(data)
 
         return Map.from_geom(self.acceptance.geom, data=data.to_value(""), unit="")
@@ -543,7 +811,11 @@ class EventDatasetOnOff(EventDataset):
         #    self.background_model(x),
         #    x
         # )
-        mu_bkg = self.background_model.integral(
+        if hasattr(self, "background_bias"):
+            background_bias = self.background_bias.value
+        else:
+            background_bias = 1.0
+        mu_bkg = background_bias * self.background_model.integral(
             energy_min=self.events_safe.energy.min(),
             energy_max=self.events_safe.energy.max(),
         )
@@ -587,11 +859,12 @@ class EventDatasetOnOff(EventDataset):
         for evaluator in self.evaluators.values():
             if evaluator.needs_update:
                 evaluator.update(
-                    self.exposure,
-                    self.psf,
-                    self.edisp,
-                    self._geom,
-                    self.mask_image,
+                    exposure=self.exposure,
+                    psf=self.psf,
+                    edisp=self.edisp_kernel_unbinned,
+                    edisp_e_reco_binned=self.edisp_e_reco_binned,
+                    geom=self._geom,
+                    mask=self.mask,
                 )
 
             if evaluator.contributes:
@@ -631,20 +904,12 @@ class EventDatasetOnOff(EventDataset):
         prob : `~numpy.ndarray`
             Background probability of the model.
         """
-        energy_reco_axis = self.edisp.axes[
+        energy_reco_axis = self.edisp_kernel_unbinned.axes[
             "energy"
         ]  # extremely important to stay consistent with the normalization computed for signal_pdf, the integration is done between energy_reco limits that are the same as the ones used in the
         data = self.background_model(energy_reco_axis.center)
         flux = Map.from_geom(geom=self.geom, data=data.value, unit=data.unit)
-
-        # energy_for_normalization = np.logspace(
-        #    np.log10(energy_reco_axis.center.min().value) if energy_min is None else np.log10(energy_min.to(energy_reco_axis.unit).value),
-        #    np.log10(energy_reco_axis.center.max().value) if energy_max is None else np.log10(energy_max.to(energy_reco_axis.unit).value),
-        #    num=100,
-        # ) * energy_reco_axis.unit
-        # normalization_factor = simpson(
-        #    self.background_model(energy_for_normalization), energy_for_normalization
-        # )
+        # NB no need for bkg bias because it's normalized
         normalization_factor = self.background_model.integral(
             energy_min=energy_reco_axis.center.min()
             if energy_min is None
@@ -659,6 +924,37 @@ class EventDatasetOnOff(EventDataset):
             return pdf, normalization_factor
         else:
             return pdf
+
+    def set_background_norm_prior(self):
+        log.debug("applying prior on the background model based on safe mask")
+        mu = (
+            len(self.events_off_safe.energy)
+            * np.mean(self.alpha.data)
+            / self.background_model.integral(
+                energy_min=self.events_off_safe.energy.min(),
+                energy_max=self.events_off_safe.energy.max(),
+            )
+            * self.background_model.norm.value
+        )
+        # if hasattr(dataset, "bias_background"):
+        #    dataset.background_model.norm.frozen = True
+        #    dataset.background_model.norm.value = mu
+        #    dataset.background_model.error = np.abs(1 - mu) / 2
+        # else :
+        self.background_model.norm.prior = GaussianPrior(mu=mu, sigma=np.abs(1 - mu))
+        self.background_model.norm.value = mu
+
+    @property
+    def mask_safe(self):
+        """Getter for mask_safe"""
+        return super().mask_safe
+
+    @mask_safe.setter
+    def mask_safe(self, value):
+        """Setter for mask_safe with custom processing"""
+        self._mask_safe = value
+        if hasattr(self, "background_model") and self.background_model is not None:
+            self.set_background_norm_prior()
 
     @property
     def events_off_safe(self):

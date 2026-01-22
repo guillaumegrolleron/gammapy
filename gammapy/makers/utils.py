@@ -332,13 +332,24 @@ def make_edisp_map(edisp, pointing, geom, exposure_map=None, use_region_center=T
 
     fov_frame = FoVICRSFrame(origin=origin)
 
+    # migra_axis = edisp.axes["migra"]
+
+    # Create temporary EDispMap Geom
+    # new_geom = geom.to_image().to_cube([migra_axis, geom.axes["energy_true"]])
+    # new_geom = RegionGeom.create(
+    #    region=geom.region,
+    #    axes=new_geom.axes,
+    # )
+
     edisp_map = project_irf_on_geom(geom, edisp, fov_frame).to_unit("")
+
+    # edisp_map = project_irf_on_geom(new_geom, edisp, fov_frame).to_unit("")
     edisp_map.normalize(axis_name="migra")
     return EDispMap(edisp_map, exposure_map)
 
 
 def make_edisp_kernel_map(
-    edisp, pointing, geom, exposure_map=None, use_region_center=True
+    edisp, pointing, geom, exposure_map=None, use_region_center=True, bias=1
 ):
     """Make an edisp kernel map for a single observation.
 
@@ -362,6 +373,8 @@ def make_edisp_kernel_map(
         For geom as a `~gammapy.maps.RegionGeom`. If True, consider the values at the region center.
         If False, average over the whole region.
         Default is True.
+    bias : float, optional
+        The bias on the energy reco to apply to the energy migration. Default is 1, meaning no bias
 
     Returns
     -------
@@ -385,7 +398,7 @@ def make_edisp_kernel_map(
         energy_axes = geom.axes["energy"]
     else:
         energy_axes = geom.axes["energy"]
-    return edisp_map.to_edisp_kernel_map(energy_axes)
+    return edisp_map.to_edisp_kernel_map(energy_axes, bias=bias)
 
 
 def make_theta_squared_table(

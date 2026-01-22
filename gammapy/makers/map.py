@@ -484,4 +484,6 @@ class MapDatasetMaker(Maker):
 
             kwargs["edisp"] = edisp
 
-        return dataset.__class__(name=dataset.name, **kwargs)
+        result = dataset.__class__(name=dataset.name, **kwargs)
+        result = dataset._propagate_needed_members(result)
+        return result

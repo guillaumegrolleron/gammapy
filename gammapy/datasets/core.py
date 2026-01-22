@@ -9,11 +9,14 @@ from astropy import units as u
 from astropy.table import Table, vstack
 from gammapy.data import GTI
 from gammapy.modeling.models import DatasetModels, Models
+from gammapy.modeling.parameter import Parameters, Parameter
 from gammapy.utils.scripts import make_name, make_path, read_yaml, to_yaml, write_yaml
 from gammapy.stats import FIT_STATISTICS_REGISTRY
 
+
 log = logging.getLogger(__name__)
 
+VALID_BIAS_PARAMETER_NAMES = ["energy_reco_bias", "background_bias"]
 
 __all__ = ["Dataset", "Datasets"]
 
@@ -36,6 +39,88 @@ class Dataset(abc.ABC):
         "diff/model": "(data - model) / model",
         "diff/sqrt(model)": "(data - model) / sqrt(model)",
     }
+
+    def _propagate_needed_members(self, dataset):
+        """
+        Propagate members needed for evaluation from self to dataset.
+        This method is used to propagate bias members computed by IRF bias makers to MapDatasetMaker or EventDatasetMaker result.
+        Parameters
+        ----------
+        dataset : Dataset
+            Dataset to propagate members to.
+        Returns
+        -------
+        dataset : Dataset
+            Dataset with propagated members.
+        """
+        for bias_parameter_name in VALID_BIAS_PARAMETER_NAMES:
+            bias_parameter = getattr(self, bias_parameter_name, None)
+            if bias_parameter is not None:
+                if not isinstance(bias_parameter, Parameter):
+                    raise TypeError(
+                        f"Bias parameter {bias_parameter_name} should be a Parameter"
+                    )
+                else:
+                    setattr(dataset, bias_parameter_name, bias_parameter)
+        return dataset
+
+    def parameter_property(param_name):
+        """
+        Create a property linked to a gammapy Parameter, with caching
+        that updates only when the Parameter.value changes.
+
+        Parameters
+        ----------
+        param_name : str
+            Name of the attribute holding a gammapy Parameter.
+        """
+        cache_attr = f"_{param_name}_value_cache"
+
+        def getter(self):
+            value = getattr(self, param_name)
+            cached_value = getattr(self, cache_attr, None)
+            if cached_value is not None and cached_value == value:
+                return cached_value
+            else:
+                setattr(self, cache_attr, value)
+            return value
+
+        def setter(self, value):
+            setattr(self, cache_attr, value)
+
+        return property(getter, setter)
+
+    def parameter_has_changed(self, param_name):
+        """
+        Check if a property linked to a gammapy Parameter has changed.
+
+        Parameters
+        ----------
+        param_name : str
+            Name of the attribute holding a gammapy Parameter.
+        """
+        cache_attr = f"_{param_name}_value_cache"
+
+        param = getattr(self, param_name)
+        value = param.value
+
+        cached_value = getattr(self, cache_attr, None)
+        if cached_value is not None and cached_value == value:
+            return False
+        else:
+            return True
+
+    @property
+    def _energy_reco_bias_has_changed(self):
+        energy_reco_bias = (
+            self.energy_reco_bias.value
+            if hasattr(self, "energy_reco_bias") and self.energy_reco_bias is not None
+            else 1.0
+        )
+        if hasattr(self, "_bias_cached"):
+            return self._bias_cached != energy_reco_bias
+        else:
+            return True
 
     @property
     def stat_type(self):
@@ -126,6 +211,16 @@ class Dataset(abc.ABC):
                 )
         return residuals
 
+    @property
+    def bias_parameters(self):
+        """List of energy bias parameters, if any."""
+        out = []
+        for bias_parameter_name in VALID_BIAS_PARAMETER_NAMES:
+            bias_parameter = getattr(self, bias_parameter_name, None)
+            if bias_parameter is not None:
+                out.append(bias_parameter)
+        return Parameters(out)
+
 
 class Datasets(collections.abc.MutableSequence):
     """Container class that holds a list of datasets.
@@ -157,13 +252,32 @@ class Datasets(collections.abc.MutableSequence):
         self._covariance = None
 
     @property
+    def bias_parameters(self):
+        """List of energy bias parameters from all datasets."""
+        bias_params = []
+        for dataset in self:
+            # if dataset.bias_parameters is not None:
+            bias_params.extend(dataset.bias_parameters)
+        return Parameters(bias_params).unique_parameters
+
+    # if len(bias_params) > 0 else None
+
+    @property
+    def models_parameters(self):
+        """List of model parameters from all datasets."""
+        return self.models.parameters.unique_parameters._parameters
+
+    @property
     def parameters(self):
         """Unique parameters (`~gammapy.modeling.Parameters`).
 
         Duplicate parameter objects have been removed.
         The order of the unique parameters remains.
         """
-        return self.models.parameters.unique_parameters
+        params = self.models_parameters
+        # if self.bias_parameters is not None:
+        params.extend(self.bias_parameters._parameters)
+        return Parameters(params)
 
     @property
     def models(self):
@@ -180,8 +294,25 @@ class Datasets(collections.abc.MutableSequence):
                     models[model] = model
         models = DatasetModels(list(models.keys()))
 
-        if self._covariance and self._covariance.parameters == models.parameters:
-            return DatasetModels(models, covariance_data=self._covariance.data)
+        # remove IRF bias parameters from covariance parameters to assert
+
+        if self._covariance:
+            params = self._covariance.parameters.select(
+                models.parameters.unique_parameters.names
+            )
+            if params == models.parameters:
+                subset_indices = [
+                    self._covariance.parameters.index(name)
+                    for name in models.parameters.names
+                ]
+                return DatasetModels(
+                    models,
+                    covariance_data=self._covariance.data[
+                        np.ix_(subset_indices, subset_indices)
+                    ],
+                )
+            else:
+                return models
         else:
             return models
 
@@ -243,9 +374,7 @@ class Datasets(collections.abc.MutableSequence):
 
     def stat_sum(self):
         """Compute joint statistic function value."""
-        prior_stat_sum = 0.0
-        if self.models is not None:
-            prior_stat_sum = self.models.parameters.prior_stat_sum()
+        prior_stat_sum = self.parameters.prior_stat_sum()
 
         stat_sum = 0.0
         for dataset in self:
